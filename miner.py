@@ -37,7 +37,6 @@ def iterative_sampling_loop(
     save_all_scores: bool = False
 ) -> None:
     """
-    Infinite loop, runs until orchestrator kills it:
       1) Sample n molecules
       2) Score them
       3) Merge with previous top x, deduplicate, sort, select top x
