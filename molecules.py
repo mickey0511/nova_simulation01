@@ -1,6 +1,6 @@
 from rdkit import Chem, DataStructs
 import bittensor as bt
-from rdkit.Chem import Descriptors, MACCSkeys
+from rdkit.Chem import Descriptors, MACCSkeys, AllChem
 from rdkit.Chem import rdFingerprintGenerator
 from dotenv import load_dotenv
 import pandas as pd
@@ -18,6 +18,14 @@ from collections import defaultdict
 from itertools import chain
 import numpy as np
 import math
+
+# Try to import synthon search
+try:
+    from rdkit.Chem import rdSynthonSpaceSearch
+    SYNTHON_SEARCH_AVAILABLE = True
+except ImportError:
+    SYNTHON_SEARCH_AVAILABLE = False
+    bt.logging.warning("RDKit synthon search not available, using fingerprint similarity")
 
 # Create global Morgan fingerprint generator to avoid deprecation warnings
 MORGAN_FP_GENERATOR = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
@@ -186,12 +194,16 @@ def sample_random_valid_molecules(
                 comp1_range = chain(range(max(1, comp1_id - seen_count * n_samples), comp1_id - (seen_count-1) * n_samples), range(max(1, comp1_id + (seen_count - 1) * n_samples), comp1_id + seen_count * n_samples + 1))
                 for new_comp1 in comp1_range:
                     new_name = f"{rxn_prefix}:{rxn_type}:{new_comp1}:{comp2_id}"
+                    if avoid_inchikeys and new_name in avoid_inchikeys:
+                        continue  # Skip if this molecule has already been seen
                     names.append(new_name)
                 
                 # Generate neighborhood around comp2_id (keep comp1_id fixed)
                 comp2_range = chain(range(max(1, comp2_id - seen_count * n_samples), comp2_id - (seen_count-1) * n_samples), range(max(1, comp2_id + (seen_count - 1) * n_samples), comp2_id + seen_count * n_samples + 1))
                 for new_comp2 in comp2_range:
                     new_name = f"{rxn_prefix}:{rxn_type}:{comp1_id}:{new_comp2}"
+                    if avoid_inchikeys and new_name in avoid_inchikeys:
+                        continue  # Skip if this molecule has already been seen
                     names.append(new_name)
                 
             if len(parts) == 5:
@@ -207,18 +219,24 @@ def sample_random_valid_molecules(
                 comp1_range = chain(range(max(1, comp1_id - seen_count * n_samples), comp1_id - (seen_count-1) * n_samples), range(max(1, comp1_id + (seen_count - 1) * n_samples), comp1_id + seen_count * n_samples + 1))
                 for new_comp1 in comp1_range:
                     new_name = f"{rxn_prefix}:{rxn_type}:{new_comp1}:{comp2_id}:{comp3_id}"
+                    if avoid_inchikeys and new_name in avoid_inchikeys:
+                        continue  # Skip if this molecule has already been seen
                     names.append(new_name)
                 
                 # Generate neighborhood around comp2_id (keep comp1_id and comp3_id fixed)
                 comp2_range = chain(range(max(1, comp2_id - seen_count * n_samples), comp2_id - (seen_count-1) * n_samples), range(max(1, comp2_id + (seen_count - 1) * n_samples), comp2_id + seen_count * n_samples + 1))
                 for new_comp2 in comp2_range:
                     new_name = f"{rxn_prefix}:{rxn_type}:{comp1_id}:{new_comp2}:{comp3_id}"
+                    if avoid_inchikeys and new_name in avoid_inchikeys:
+                        continue  # Skip if this molecule has already been seen
                     names.append(new_name)
                 
                 # Generate neighborhood around comp3_id (keep comp1_id and comp2_id fixed)
                 comp3_range = chain(range(max(1, comp3_id - seen_count * n_samples), comp3_id - (seen_count-1) * n_samples), range(max(1, comp3_id + (seen_count - 1) * n_samples), comp3_id + seen_count * n_samples + 1))
                 for new_comp3 in comp3_range:
                     new_name = f"{rxn_prefix}:{rxn_type}:{comp1_id}:{comp2_id}:{new_comp3}"
+                    if avoid_inchikeys and new_name in avoid_inchikeys:
+                        continue  # Skip if this molecule has already been seen
                     names.append(new_name)
 
         except (ValueError, IndexError) as e:
@@ -308,7 +326,7 @@ class SynthonLibrary:
         if not self.reaction_info:
             raise ValueError(f"Could not load reaction {rxn_id}")
         
-        _, self.roleA, self.roleB, self.roleC = self.reaction_info
+        self.smarts, self.roleA, self.roleB, self.roleC = self.reaction_info
         self.is_three_component = self.roleC is not None and self.roleC != 0
         
         # Load all components
@@ -340,7 +358,7 @@ class SynthonLibrary:
         self, 
         target_smiles: str, 
         role: str = 'A',
-        top_k: int = 60,  # DECREASED: Balanced exploration
+        top_k: int = 80,  # BALANCED: Find good number of similar components
         min_similarity: float = 0.5
     ) -> List[Tuple[int, float]]:
         """
@@ -372,7 +390,7 @@ class SynthonLibrary:
         else:
             return []
         
-        # Calculate similarities - BALANCED: check all components
+        # Calculate similarities - MORE AGGRESSIVE: check all components
         similarities = []
         for mol_id, fp in fps_dict.items():
             try:
@@ -474,7 +492,7 @@ class SynthonLibrary:
     ) -> List[str]:
         """
         Generate new molecule names by finding similar components to base molecules.
-        BALANCED EXPLORATION: Moderate variations for balanced search.
+        ULTIMATE PERFECTED: Maximum variations for top molecules.
         
         Args:
             base_molecule_names: List of high-scoring molecule names
@@ -486,13 +504,14 @@ class SynthonLibrary:
         """
         new_molecules = []
         
-        # BALANCED: When only one base molecule, moderate boost
+        # SUPER-AGGRESSIVE: When only one base molecule, MAXIMUM variations
         is_single_molecule = len(base_molecule_names) == 1
+        # For single molecule with high n_per_base, use as-is; otherwise boost significantly
         if is_single_molecule:
-            if n_per_base >= 50:
-                effective_n_per_base = n_per_base  # Already good
+            if n_per_base >= 80:
+                effective_n_per_base = n_per_base  # Already maximum
             else:
-                effective_n_per_base = n_per_base * 2  # 2x multiplier - BALANCED
+                effective_n_per_base = n_per_base * 3  # 3x multiplier for single top molecule - BALANCED
         else:
             effective_n_per_base = n_per_base
         
@@ -506,7 +525,7 @@ class SynthonLibrary:
                     _, rxn, A_id, B_id = parts
                     A_id, B_id = int(A_id), int(B_id)
                     
-                    # Find similar components - BALANCED
+                    # Find similar components - PERFECTED: find more for single molecule
                     similar_comps = self.find_similar_to_molecule_name(
                         base_name, 'both', effective_n_per_base, min_similarity
                     )
@@ -554,7 +573,7 @@ def generate_molecules_from_synthon_library(
 ) -> pd.DataFrame:
     """
     Generate new molecules using synthon similarity search.
-    BALANCED EXPLORATION: Balanced exploitation of top molecules.
+    ULTIMATE PERFECTED: Maximum exploitation of top molecules.
     
     Args:
         synthon_lib: Initialized SynthonLibrary
@@ -569,16 +588,18 @@ def generate_molecules_from_synthon_library(
     if top_molecules.empty:
         return pd.DataFrame(columns=["name"])
     
-    # BALANCED: When only 1 molecule, moderate exploitation
+    # SUPER-AGGRESSIVE: When only 1 molecule, MAXIMUM exploitation
     if len(top_molecules) == 1:
+        # Single molecule: generate MAXIMUM variations
         seed_names = top_molecules["name"].tolist()
-        if n_per_base >= 50:
-            effective_n_per_base = n_per_base
+        # SUPER-AGGRESSIVE: For single top molecule, use 4x variations if n_per_base is high
+        if n_per_base >= 80:
+            effective_n_per_base = n_per_base  # Already high, use as-is
         else:
-            effective_n_per_base = n_per_base * 2  # 2x multiplier - BALANCED
+            effective_n_per_base = n_per_base * 4  # 4x multiplier for single molecule - SUPER-AGGRESSIVE
     else:
         # Multiple molecules: use appropriate number
-        n_seeds = min(35, len(top_molecules))  # More seeds for exploration
+        n_seeds = min(30, len(top_molecules))  # More seeds like model1
         seed_names = top_molecules.head(n_seeds)["name"].tolist()
         effective_n_per_base = n_per_base
     
@@ -592,9 +613,9 @@ def generate_molecules_from_synthon_library(
     if not new_names:
         return pd.DataFrame(columns=["name"])
     
-    # BALANCED: Keep moderate variations
-    if len(new_names) > n_samples * 2.5:  # Moderate overflow
-        new_names = random.sample(new_names, int(n_samples * 1.8))  # Keep moderate
+    # SUPER-AGGRESSIVE: Keep all high-quality variations, only sample if excessive
+    if len(new_names) > n_samples * 3.0:  # Allow more overflow
+        new_names = random.sample(new_names, int(n_samples * 2.0))  # Keep more
     
     return pd.DataFrame({"name": new_names})
 
@@ -617,7 +638,7 @@ def generate_valid_random_molecules_batch(
         bt.logging.error(f"Could not get reaction info for rxn_id {rxn_id}")
         return pd.DataFrame(columns=["name", "smiles", "InChIKey"])
     
-    _, roleA, roleB, roleC = reaction_info
+    smarts, roleA, roleB, roleC = reaction_info
     is_three_component = roleC is not None and roleC != 0
     
     molecules_A = get_molecules_by_role(roleA, db_path)
@@ -648,7 +669,7 @@ def generate_valid_random_molecules_batch(
     
     while total_valid < n_samples:
         needed = n_samples - total_valid
-        batch_size_actual = min(max(batch_size, 250), needed * 2)
+        batch_size_actual = min(max(batch_size, 300), needed * 2)
         
         emitted_names = set()
         if elite_names:
@@ -856,20 +877,20 @@ def generate_offspring_from_elites(rxn_id: int, n: int,
             avoid_names.add(cand)
     return out
 
-def select_diverse_elites(top_pool: pd.DataFrame, n_elites: int, min_score_ratio: float = 0.70) -> pd.DataFrame:
+def select_diverse_elites(top_pool: pd.DataFrame, n_elites: int, min_score_ratio: float = 0.65) -> pd.DataFrame:
     """
     Select diverse elite molecules: top by score, but ensure diversity in component space.
-    BALANCED: Higher threshold for balanced selection.
+    ENHANCED: Lower threshold to include more candidates, better diversity.
     """
     if top_pool.empty or n_elites <= 0:
         return pd.DataFrame()
     
     # Take MORE top candidates for better diversity selection
-    top_candidates = top_pool.head(min(len(top_pool), n_elites * 3))  # DECREASED from 4
+    top_candidates = top_pool.head(min(len(top_pool), n_elites * 4))  # Increased from 3
     if len(top_candidates) <= n_elites:
         return top_candidates
     
-    # Score threshold: HIGHER threshold for balanced selection
+    # Score threshold: LOWER threshold to include more candidates
     max_score = top_candidates['score'].max()
     threshold = max_score * min_score_ratio
     candidates = top_candidates[top_candidates['score'] >= threshold]
@@ -893,7 +914,7 @@ def select_diverse_elites(top_pool: pd.DataFrame, n_elites: int, min_score_ratio
             except (ValueError, IndexError):
                 pass
     
-    # Then add diverse molecules - BALANCED diversity selection
+    # Then add diverse molecules - MORE AGGRESSIVE diversity selection
     for idx, row in candidates.iterrows():
         if len(selected) >= n_elites:
             break
@@ -907,13 +928,13 @@ def select_diverse_elites(top_pool: pd.DataFrame, n_elites: int, min_score_ratio
                 B_id = int(parts[3])
                 C_id = int(parts[4]) if len(parts) > 4 else None
                 
-                # Prefer molecules with new components - BALANCED
+                # Prefer molecules with new components - MORE AGGRESSIVE
                 is_diverse = (A_id not in used_components['A'] or 
                              B_id not in used_components['B'] or
                              (C_id is not None and C_id not in used_components['C']))
                 
-                # Balanced threshold for diversity
-                if is_diverse or len(selected) < n_elites * 0.5:  # DECREASED from 0.6
+                # Lower threshold for diversity - include more diverse molecules
+                if is_diverse or len(selected) < n_elites * 0.6:  # Increased from 0.5
                     selected.append(idx)
                     used_components['A'].add(A_id)
                     used_components['B'].add(B_id)
@@ -936,7 +957,7 @@ def select_diverse_elites(top_pool: pd.DataFrame, n_elites: int, min_score_ratio
 def build_component_weights(top_pool: pd.DataFrame, rxn_id: int) -> Dict[str, Dict[int, float]]:
     """
     Build component weights based on scores of molecules containing them.
-    BALANCED: Use moderate exponential weighting for balanced exploration.
+    ENHANCED: Use exponential weighting for top molecules to emphasize best components.
     Returns dict with 'A', 'B', 'C' keys mapping to {component_id: weight}
     """
     weights = {'A': defaultdict(float), 'B': defaultdict(float), 'C': defaultdict(float)}
@@ -945,15 +966,18 @@ def build_component_weights(top_pool: pd.DataFrame, rxn_id: int) -> Dict[str, Di
     if top_pool.empty:
         return weights
     
-    # Extract component IDs and scores with MODERATE exponential weighting
+    # Get max score for normalization
+    max_score = top_pool['score'].max() if not top_pool.empty else 1.0
+    
+    # Extract component IDs and scores with EXPONENTIAL weighting for top molecules
     for idx, row in top_pool.iterrows():
         name = row['name']
         score = row['score']
         
-        # MODERATE exponential weighting: balanced contribution
-        # Rank-based exponential: rank 1 gets weight 2.0, rank 10 gets weight 1.1, etc.
+        # BALANCED exponential weighting: top molecules contribute more but not excessively
+        # Rank-based exponential: rank 1 gets weight 2.5, rank 10 gets weight 1.2, etc.
         rank = idx + 1
-        rank_weight = 2.0 * math.exp(-rank / 20.0)  # Gentler exponential decay
+        rank_weight = 2.5 * math.exp(-rank / 18.0)  # Balanced exponential decay
         weighted_score = max(0, score) * rank_weight
         
         parts = name.split(":")
@@ -979,7 +1003,7 @@ def build_component_weights(top_pool: pd.DataFrame, rxn_id: int) -> Dict[str, Di
             if counts[role][comp_id] > 0:
                 # Average with exponential weighting preserved
                 avg_weight = weights[role][comp_id] / counts[role][comp_id]
-                # Add moderate smoothing
-                weights[role][comp_id] = avg_weight + 0.10  # DECREASED smoothing
+                # Add smoothing but keep the exponential boost
+                weights[role][comp_id] = avg_weight + 0.15  # Balanced smoothing
     
     return weights
